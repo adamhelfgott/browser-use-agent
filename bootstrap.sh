@@ -54,7 +54,7 @@ if [ ! -s "$BU_HOME/credentials/api_key" ]; then
   if [ -n "${BROWSER_USE_API_KEY:-}" ]; then
     printf '%s' "$BROWSER_USE_API_KEY" > "$BU_HOME/credentials/api_key"
   elif command -v doppler >/dev/null 2>&1; then
-    DP_PROJECT="${BU_DOPPLER_PROJECT:-shared-vendors}"
+    DP_PROJECT="${BU_DOPPLER_PROJECT:-cloud-agents}"
     DP_CONFIG="${BU_DOPPLER_CONFIG:-prd}"
     if doppler secrets get BROWSER_USE_API_KEY -p "$DP_PROJECT" -c "$DP_CONFIG" \
          --plain > "$BU_HOME/credentials/api_key.tmp" 2>/dev/null \
