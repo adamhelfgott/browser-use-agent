@@ -1,0 +1,541 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["browser-use-sdk>=3.11.1"]
+# ///
+"""bu — Browser Use Cloud for local agents (Claude, Codex, humans).
+
+Shared home: ~/.agents/browser/  (config.json, credentials/api_key, runs/ ledger)
+Docs map: ~/.agents/skills/browser-use-cloud/SKILL.md
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+BU_HOME = Path(os.environ.get("BU_HOME", Path.home() / ".agents" / "browser"))
+CONFIG_PATH = BU_HOME / "config.json"
+KEY_PATH = BU_HOME / "credentials" / "api_key"
+LEDGER = BU_HOME / "runs" / "ledger.jsonl"
+
+DEFAULT_CONFIG = {
+    "default_model": "gpt-5.6-luna",
+    "profiles": {},
+    "notify_imessage": "",
+    "human_suffix": (
+        " If you encounter a login you cannot complete, a 2FA prompt, a CAPTCHA, "
+        "or a payment/confirmation step that requires a human, do not guess: stop "
+        "and clearly report exactly what a human needs to do."
+    ),
+}
+
+KNOWN_MODELS = [
+    "gpt-5.6-luna (default; cheap, recommended by Browser Use)",
+    "gpt-5.6-sol (harder reasoning)",
+    "kimi-k3 (Moonshot; cheapest viable)",
+    "claude-sonnet-5", "claude-opus-5", "claude-fable-5",
+    "gemini-3.6-flash", "grok-4.5", "glm-5.2", "minimax-m3",
+]
+
+
+def config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        cfg.update(json.loads(CONFIG_PATH.read_text()))
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def api_key() -> str:
+    key = os.environ.get("BROWSER_USE_API_KEY", "").strip()
+    if not key and KEY_PATH.exists():
+        key = KEY_PATH.read_text().strip()
+    if not key:
+        sys.exit(f"error: no API key in BROWSER_USE_API_KEY or {KEY_PATH}")
+    os.environ["BROWSER_USE_API_KEY"] = key
+    return key
+
+
+def v4():
+    from browser_use_sdk.v4 import BrowserUse
+    return BrowserUse(api_key=api_key())
+
+
+def v3():
+    from browser_use_sdk.v3 import BrowserUse
+    return BrowserUse(api_key=api_key())
+
+
+def log_ledger(kind: str, **fields) -> None:
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"ts": datetime.now(timezone.utc).isoformat(), "kind": kind, **fields}
+    with LEDGER.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def notify(text: str) -> None:
+    target = config().get("notify_imessage", "")
+    if not target:
+        print("(notify: no notify_imessage configured; skipping iMessage)")
+        return
+    script = (
+        'tell application "Messages" to send "{msg}" to buddy "{to}" '
+        'of (service 1 whose service type is iMessage)'
+    ).format(msg=text.replace('"', "'"), to=target)
+    try:
+        subprocess.run(["osascript", "-e", script], check=True,
+                       capture_output=True, timeout=15)
+        print(f"(notified {target} via iMessage)")
+    except Exception as exc:  # osascript missing, Messages not signed in, etc.
+        print(f"(notify failed: {exc})")
+
+
+def resolve_profile(name_or_id: str | None) -> str | None:
+    if not name_or_id:
+        return None
+    return config()["profiles"].get(name_or_id, name_or_id)
+
+
+PROFILE_CACHE = BU_HOME / "profiles.cache.json"
+CACHE_TTL = 3600  # sessions only change on re-sync; an hour is plenty
+
+
+def load_profiles(refresh: bool = False) -> list[dict]:
+    """Profiles with cookie_domains, cached to avoid an API call per lookup."""
+    if not refresh and PROFILE_CACHE.exists():
+        try:
+            blob = json.loads(PROFILE_CACHE.read_text())
+            if time.time() - blob.get("ts", 0) < CACHE_TTL:
+                return blob["profiles"]
+        except (json.JSONDecodeError, KeyError):
+            pass
+    resp = v3().profiles.list().model_dump(mode="json")
+    profiles = resp.get("items", resp.get("profiles", []))
+    PROFILE_CACHE.write_text(json.dumps({"ts": time.time(), "profiles": profiles}))
+    return profiles
+
+
+def normalize_domain(target: str) -> str:
+    t = target.strip().lower()
+    if "://" in t:
+        t = t.split("://", 1)[1]
+    t = t.split("/", 1)[0].split(":", 1)[0]
+    return t[4:] if t.startswith("www.") else t
+
+
+def domain_match(target: str, cookie: str) -> bool:
+    c = cookie.lower()
+    return target == c or target.endswith("." + c) or c.endswith("." + target)
+
+
+def resolve_for(domain: str, refresh: bool = False) -> list[tuple[str, str, int]]:
+    """Return [(name, id, match_count)] for profiles holding a session for domain,
+    strongest first. Aliased names preferred as the display name."""
+    target = normalize_domain(domain)
+    aliases = {v: k for k, v in config()["profiles"].items()}
+    scored = []
+    for p in load_profiles(refresh):
+        cds = p.get("cookie_domains") or []
+        score = sum(1 for c in cds if domain_match(target, c))
+        if score:
+            name = aliases.get(p["id"], p.get("name") or p["id"])
+            scored.append((name, p["id"], score))
+    return sorted(scored, key=lambda x: x[2], reverse=True)
+
+
+def pick_profile_for(domain: str) -> str | None:
+    """One profile id for --for, or None (no session). Ambiguous ties exit."""
+    matches = resolve_for(domain)
+    if not matches:
+        print(f"(no synced session for {normalize_domain(domain)} in any profile — "
+              f"run may hit a login wall; `bu profile sync` to add one)")
+        return None
+    if len(matches) > 1 and matches[0][2] == matches[1][2]:
+        names = ", ".join(f"{m[0]}({m[2]})" for m in matches)
+        sys.exit(f"error: {normalize_domain(domain)} matches multiple profiles "
+                 f"equally [{names}] — pass --profile NAME explicitly")
+    name, pid, score = matches[0]
+    print(f"(profile: {name} — {score} matching session domain(s) for "
+          f"{normalize_domain(domain)})")
+    return pid
+
+
+# Effort → V4 modelParams path, keyed by model family (docs 2026-08-31).
+def build_model_params(model: str, effort: str) -> dict | None:
+    m = (model or "").lower()
+    if m.startswith("gpt-"):
+        return {"reasoning": {"effort": effort}}
+    if m.startswith("claude-") and "fable" not in m:
+        return {"output_config": {"effort": effort}}
+    if m.startswith("gemini-"):
+        level = {"none": "minimal", "xhigh": "high", "max": "high"}.get(effort, effort)
+        return {"thinkingConfig": {"thinkingLevel": level}}
+    print(f"(note: {model} does not accept a reasoning-effort param; --effort ignored)")
+    return None
+
+
+def find_urls(obj, needle=("live", "url")) -> list[str]:
+    """Recursively find values under keys containing all needle substrings."""
+    hits = []
+    if isinstance(obj, dict):
+        for k, val in obj.items():
+            if all(n in k.lower() for n in needle) and isinstance(val, str):
+                hits.append(val)
+            else:
+                hits.extend(find_urls(val, needle))
+    elif isinstance(obj, list):
+        for val in obj:
+            hits.extend(find_urls(val, needle))
+    return hits
+
+
+TERMINAL = {"completed", "failed", "cancelled"}
+
+
+def stream_run(client, run_id: str, do_notify: bool, as_json: bool,
+               timeout: float = 14400) -> "object":
+    """Poll events + status until terminal. Returns final RunSummary."""
+    after = None
+    live_seen = False
+    start = time.time()
+    while True:
+        page = client.runs.events(run_id, after=after)
+        for ev in page.events:
+            data = ev.model_dump() if hasattr(ev, "model_dump") else dict(ev)
+            etype = data.get("type") or data.get("event_type") or "?"
+            after = data.get("id") or data.get("seq") or after
+            if not as_json:
+                print(f"  [{etype}]")
+            if not live_seen:
+                for url in find_urls(data):
+                    live_seen = True
+                    print(f"\nLIVE VIEW (treat as a credential): {url}\n")
+                    if do_notify:
+                        notify(f"Browser run {run_id[:8]} live view: {url}")
+        if getattr(page, "next_after", None) is not None:
+            after = page.next_after
+        status = client.runs.status(run_id).status
+        status = getattr(status, "value", status)
+        if status in TERMINAL:
+            return client.runs.get(run_id)
+        if time.time() - start > timeout:
+            sys.exit(f"error: timed out after {timeout}s; run {run_id} still {status}")
+        time.sleep(3)
+
+
+def finish_run(summary, do_notify: bool, as_json: bool, sensitive: bool) -> None:
+    s = summary.model_dump(mode="json")
+    status = str(s.get("status"))
+    log_ledger(
+        "run_finished", run_id=str(s.get("id")), status=status,
+        task=(s.get("task") or "")[:300], model=s.get("model"),
+        session_id=str(s.get("session_id")), workspace_id=str(s.get("workspace_id")),
+        cost_usd=s.get("total_cost_usd"),
+        result=None if sensitive else (s.get("result") or "")[:2000],
+        error=s.get("error"), sensitive=sensitive,
+    )
+    if as_json:
+        print(json.dumps(s, default=str, indent=2))
+    else:
+        print(f"\nstatus: {status}   cost: ${s.get('total_cost_usd')}")
+        if s.get("error"):
+            print(f"error: {s['error']}")
+        if s.get("result"):
+            print(f"\n--- result ---\n{s['result']}")
+        if sensitive:
+            print("\n(sensitive mode: result NOT written to ledger — "
+                  "store any credential in its proper home now)")
+    if do_notify:
+        notify(f"Browser run {str(s.get('id'))[:8]} {status}. "
+               + ("It needs you or is done — check terminal." if not s.get("error")
+                  else f"Error: {str(s.get('error'))[:100]}"))
+
+
+def cmd_run(a) -> None:
+    cfg = config()
+    client = v4()
+    task = a.task if a.raw_task else a.task + cfg["human_suffix"]
+    bs = {}
+    profile_id = None
+    if a.profile:
+        profile_id = resolve_profile(a.profile)
+    elif getattr(a, "for_domain", None):
+        profile_id = pick_profile_for(a.for_domain)
+    if profile_id:
+        bs["profile_id"] = profile_id
+    if a.no_proxy:
+        bs["proxy_country_code"] = None
+    elif a.country:
+        bs["proxy_country_code"] = a.country
+    model = a.model or cfg["default_model"]
+    kwargs = dict(model=model)
+    if bs:
+        kwargs["browser_settings"] = bs
+    if getattr(a, "effort", None):
+        mp = build_model_params(model, a.effort)
+        if mp:
+            kwargs["model_params"] = mp
+    if a.session:
+        kwargs["session_id"] = a.session
+    if a.workspace:
+        kwargs["workspace_id"] = a.workspace
+    if a.max_cost:
+        kwargs["max_cost_usd"] = a.max_cost
+    if a.agentmail:
+        kwargs["agentmail"] = True
+    run = client.runs.create(task, **kwargs)
+    print(f"run: {run.id}\nsession: {run.session_id}\n"
+          f"workspace: {run.workspace_id}\nmodel: {run.model}")
+    log_ledger("run_created", run_id=str(run.id), task=a.task[:300],
+               model=str(run.model), session_id=str(run.session_id),
+               sensitive=a.sensitive)
+    if a.no_wait:
+        print(f"\nnot waiting; later: bu watch {run.id}")
+        return
+    summary = stream_run(client, run.id, a.notify, a.json)
+    finish_run(summary, a.notify, a.json, a.sensitive)
+
+
+def cmd_watch(a) -> None:
+    client = v4()
+    summary = stream_run(client, a.run_id, a.notify, a.json)
+    finish_run(summary, a.notify, a.json, a.sensitive)
+
+
+def cmd_status(a) -> None:
+    st = v4().runs.status(a.run_id).status
+    print(getattr(st, "value", st))
+
+
+def cmd_get(a) -> None:
+    print(json.dumps(v4().runs.get(a.run_id).model_dump(mode="json"), indent=2))
+
+
+def cmd_cancel(a) -> None:
+    s = v4().runs.cancel(a.run_id)
+    log_ledger("run_cancelled", run_id=str(a.run_id))
+    print(f"cancelled: {s.id} → {s.status}")
+
+
+def cmd_files(a) -> None:
+    client = v4()
+    page = client.workspaces.files(a.workspace_id, include_urls=bool(a.download))
+    for f in page.files:
+        d = f.model_dump()
+        print(d.get("path") or d.get("name"))
+        if a.download and d.get("url"):
+            import urllib.request
+            dest = Path(a.download) / Path(d.get("path") or d.get("name")).name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(d["url"], dest)  # URLs expire in 60s
+            print(f"  -> {dest}")
+
+
+def cmd_browser(a) -> None:
+    client = v3()
+    if a.action == "start":
+        kwargs = {}
+        if a.profile:
+            kwargs["profile_id"] = resolve_profile(a.profile)
+        if a.no_proxy:
+            kwargs["proxy_country_code"] = None
+        elif a.country:
+            kwargs["proxy_country_code"] = a.country
+        b = client.browsers.create(**kwargs)
+        log_ledger("browser_started", browser_id=str(b.id))
+        print(f"browser: {b.id}\ncdp: {b.cdp_url}\nlive (credential-grade): {b.live_url}")
+        print(f"\nBILLING RUNS UNTIL STOPPED: bu browser stop {b.id}")
+    elif a.action == "list":
+        for b in client.browsers.list().items:
+            status = getattr(b.status, "value", b.status)
+            print(f"{b.id}  {status}  started {b.started_at}")
+    elif a.action == "stop":
+        ids = [a.id] if a.id else []
+        if a.all:
+            ids = [b.id for b in client.browsers.list().items
+                   if getattr(b.status, "value", str(b.status)) not in ("stopped", "finished")]
+        if not ids:
+            sys.exit("error: give a browser id or --all")
+        for bid in ids:
+            b = client.browsers.stop(bid)
+            log_ledger("browser_stopped", browser_id=str(bid),
+                       browser_cost=getattr(b, "browser_cost", None),
+                       proxy_cost=getattr(b, "proxy_cost", None))
+            print(f"stopped {bid}  browser ${b.browser_cost}  proxy ${b.proxy_cost}")
+
+
+def cmd_profile(a) -> None:
+    cfg = config()
+    if a.action == "list":
+        for p in v3().profiles.list().model_dump().get("items", []):
+            print(json.dumps(p, default=str))
+        if cfg["profiles"]:
+            print("\nlocal aliases:", json.dumps(cfg["profiles"], indent=2))
+    elif a.action == "create":
+        p = v3().profiles.create(**({"name": a.name} if a.name else {}))
+        d = p.model_dump()
+        pid = str(d.get("id") or d.get("profile_id"))
+        if a.name:
+            cfg["profiles"][a.name] = pid
+            save_config(cfg)
+        print(json.dumps(d, default=str, indent=2))
+    elif a.action == "alias":
+        cfg["profiles"][a.name] = a.id
+        save_config(cfg)
+        print(f"alias {a.name} -> {a.id}")
+    elif a.action == "sync":
+        print("Launching Browser Use profile sync (interactive — you pick the "
+              "accounts; passwords never leave your machine, only session state):")
+        api_key()
+        os.execvp("sh", ["sh", "-c",
+                  "curl -fsSL https://browser-use.com/profile.sh | sh"])
+
+
+def cmd_which(a) -> None:
+    matches = resolve_for(a.domain, refresh=a.refresh)
+    if a.json:
+        print(json.dumps([{"profile": n, "id": i, "score": s}
+                          for n, i, s in matches], indent=2))
+        return
+    tgt = normalize_domain(a.domain)
+    if not matches:
+        print(f"no profile has a session for {tgt}")
+        print("→ run `bu profile sync` and log into it locally first")
+        return
+    print(f"profiles with a session for {tgt} (strongest first):")
+    for name, pid, score in matches:
+        print(f"  {name:16} {score} matching domain(s)")
+    print(f"\n→ use: --profile {matches[0][0]}   (or --for {tgt})")
+
+
+def cmd_models(_a) -> None:
+    print("Models for agent runs (--model). Verified 2026-08-31; "
+          "authoritative list: https://docs.browser-use.com/cloud/agent/models")
+    for m in KNOWN_MODELS:
+        print(f"  {m}")
+
+
+def cmd_config(a) -> None:
+    cfg = config()
+    if a.key and a.value is not None:
+        try:
+            cfg[a.key] = json.loads(a.value)
+        except json.JSONDecodeError:
+            cfg[a.key] = a.value
+        save_config(cfg)
+    print(json.dumps(cfg, indent=2))
+
+
+def cmd_ledger(a) -> None:
+    if not LEDGER.exists():
+        print("(empty)")
+        return
+    for line in LEDGER.read_text().splitlines()[-a.n:]:
+        print(line)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="bu", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def run_flags(sp):
+        sp.add_argument("--model")
+        sp.add_argument("--effort",
+                        choices=["none", "low", "medium", "high", "xhigh", "max"],
+                        help="reasoning effort (gpt-*/claude-*/gemini-* only)")
+        sp.add_argument("--profile", help="profile alias or id")
+        sp.add_argument("--for", dest="for_domain", metavar="DOMAIN",
+                        help="auto-pick the profile with a session for DOMAIN")
+        sp.add_argument("--workspace")
+        sp.add_argument("--max-cost", type=float, help="spend limit USD")
+        sp.add_argument("--country", help="proxy country code (default us)")
+        sp.add_argument("--no-proxy", action="store_true")
+        sp.add_argument("--agentmail", action="store_true",
+                        help="give the agent a throwaway email inbox")
+        sp.add_argument("--raw-task", action="store_true",
+                        help="don't append the stop-for-human instruction")
+        sp.add_argument("--sensitive", action="store_true",
+                        help="never write the result to the ledger")
+        sp.add_argument("--no-wait", action="store_true")
+        sp.add_argument("--notify", action="store_true",
+                        help="iMessage the configured number on live-view + finish")
+        sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("run", help="dispatch an agent run")
+    sp.add_argument("task")
+    sp.add_argument("--session", help="continue an existing session")
+    run_flags(sp)
+    sp.set_defaults(fn=cmd_run)
+
+    sp = sub.add_parser("continue", help="resume a session after human takeover")
+    sp.add_argument("session")
+    sp.add_argument("task")
+    run_flags(sp)
+    sp.set_defaults(fn=cmd_run)
+
+    for name, fn in [("watch", cmd_watch)]:
+        sp = sub.add_parser(name, help="attach to a run until it finishes")
+        sp.add_argument("run_id")
+        sp.add_argument("--notify", action="store_true")
+        sp.add_argument("--sensitive", action="store_true")
+        sp.add_argument("--json", action="store_true")
+        sp.set_defaults(fn=fn)
+
+    for name, fn in [("status", cmd_status), ("get", cmd_get), ("cancel", cmd_cancel)]:
+        sp = sub.add_parser(name)
+        sp.add_argument("run_id")
+        sp.set_defaults(fn=fn)
+
+    sp = sub.add_parser("files", help="list/download workspace files")
+    sp.add_argument("workspace_id")
+    sp.add_argument("--download", metavar="DIR",
+                    help="download files here (URLs expire in 60s)")
+    sp.set_defaults(fn=cmd_files)
+
+    sp = sub.add_parser("browser", help="bare cloud Chrome over CDP (no agent)")
+    sp.add_argument("action", choices=["start", "list", "stop"])
+    sp.add_argument("id", nargs="?")
+    sp.add_argument("--all", action="store_true", help="stop: sweep all running")
+    sp.add_argument("--profile")
+    sp.add_argument("--country")
+    sp.add_argument("--no-proxy", action="store_true")
+    sp.set_defaults(fn=cmd_browser)
+
+    sp = sub.add_parser("profile", help="persistent login profiles")
+    sp.add_argument("action", choices=["list", "create", "alias", "sync"])
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("id", nargs="?")
+    sp.set_defaults(fn=cmd_profile)
+
+    sp = sub.add_parser("which", help="which profile has a session for a domain")
+    sp.add_argument("domain", help="domain or URL, e.g. vercel.com")
+    sp.add_argument("--refresh", action="store_true", help="bypass profile cache")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(fn=cmd_which)
+
+    sub.add_parser("models").set_defaults(fn=cmd_models)
+
+    sp = sub.add_parser("config")
+    sp.add_argument("key", nargs="?")
+    sp.add_argument("value", nargs="?")
+    sp.set_defaults(fn=cmd_config)
+
+    sp = sub.add_parser("ledger")
+    sp.add_argument("n", nargs="?", type=int, default=20)
+    sp.set_defaults(fn=cmd_ledger)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

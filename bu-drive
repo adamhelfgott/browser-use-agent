@@ -1,0 +1,234 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["browser-use-sdk>=3.11.1", "playwright>=1.40"]
+# ///
+"""bu-drive — a Claude session drives a persistent Browser Use cloud Chrome over CDP,
+so you can watch (live_url) while I step/screenshot/inspect/ablate. NOT the hosted
+agent: every move is mine, deterministic, observable.
+
+  bu-drive start [--profile NAME] [--url URL] [--no-proxy]   open a cloud browser
+  bu-drive url <URL>                                          navigate
+  bu-drive shot                                               screenshot -> file
+  bu-drive click <selector>                                   Playwright selector syntax
+  bu-drive fill <selector> <text>
+  bu-drive press <key>
+  bu-drive text [selector]                                    inner_text (default body)
+  bu-drive eval '<js>'                                        run JS in page, print result
+  bu-drive info                                               url, title, live_url
+  bu-drive stop                                               stop browser (ends billing)
+
+Selectors use Playwright syntax: "text=Save", "role=button[name=Submit]", "#id",
+".class", "xpath=...". Mutating verbs auto-screenshot and accept --logs to also print
+console + network captured during that action. State persists between calls (the
+cloud browser is durable; only my client connection is ephemeral).
+"""
+import argparse, json, os, sys, time
+from pathlib import Path
+
+BU_HOME = Path(os.environ.get("BU_HOME", Path.home() / ".agents" / "browser"))
+STATE = BU_HOME / "drive.json"
+KEY_PATH = BU_HOME / "credentials" / "api_key"
+SHOT_DIR = Path(os.environ.get("BU_DRIVE_SHOTS",
+    "/private/tmp/claude-501/-Users-adamhelfgott-projects/"
+    "b0f19f5c-6f97-4f3e-8b88-4ffba1305146/scratchpad/drive"))
+
+
+def key() -> str:
+    k = os.environ.get("BROWSER_USE_API_KEY", "").strip()
+    if not k and KEY_PATH.exists():
+        k = KEY_PATH.read_text().strip()
+    if not k:
+        sys.exit("error: no API key")
+    os.environ["BROWSER_USE_API_KEY"] = k
+    return k
+
+
+def cfg_profiles() -> dict:
+    p = BU_HOME / "config.json"
+    return json.loads(p.read_text()).get("profiles", {}) if p.exists() else {}
+
+
+def load_state() -> dict:
+    if not STATE.exists():
+        sys.exit("no active drive session — run `bu-drive start` first")
+    return json.loads(STATE.read_text())
+
+
+def save_state(d: dict) -> None:
+    STATE.write_text(json.dumps(d))
+
+
+def next_shot(st: dict) -> Path:
+    st["n"] = st.get("n", 0) + 1
+    SHOT_DIR.mkdir(parents=True, exist_ok=True)
+    return SHOT_DIR / f"{st['n']:03d}.png"
+
+
+class Driver:
+    """Connect over CDP, act, disconnect. Browser persists remotely."""
+    def __init__(self, st, capture_logs=False):
+        self.st, self.capture = st, capture_logs
+        self.console, self.net = [], []
+
+    def __enter__(self):
+        from playwright.sync_api import sync_playwright
+        self._pw = sync_playwright().start()
+        self.browser = self._pw.chromium.connect_over_cdp(self.st["cdp_url"])
+        ctx = self.browser.contexts[0] if self.browser.contexts \
+            else self.browser.new_context()
+        self.page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        if self.capture:
+            self.page.on("console", lambda m: self.console.append(
+                f"[{m.type}] {m.text}"))
+            self.page.on("requestfailed", lambda r: self.net.append(
+                f"FAILED {r.method} {r.url} — {r.failure}"))
+            self.page.on("response", lambda r: (r.status >= 400) and self.net.append(
+                f"{r.status} {r.request.method} {r.url}"))
+        return self
+
+    def __exit__(self, *a):
+        try:
+            self.browser.close()      # disconnect only; remote browser lives on
+        finally:
+            self._pw.stop()
+
+    def dump_logs(self):
+        if self.console:
+            print("--- console ---"); [print(" ", c) for c in self.console[-25:]]
+        if self.net:
+            print("--- network (>=400 / failed) ---"); [print(" ", n) for n in self.net[-25:]]
+
+    def screenshot(self):
+        path = next_shot(self.st)
+        self.page.screenshot(path=str(path), full_page=False)
+        save_state(self.st)
+        print(f"shot: {path}")
+        print(f"page: {self.page.url}")
+
+
+def cmd_start(a):
+    from browser_use_sdk.v3 import BrowserUse
+    key()
+    kw = {}
+    pid = cfg_profiles().get(a.profile, a.profile) if a.profile else None
+    if pid:
+        kw["profile_id"] = pid
+    if a.no_proxy:
+        kw["proxy_country_code"] = None
+    b = BrowserUse().browsers.create(**kw)
+    st = {"browser_id": str(b.id), "cdp_url": b.cdp_url, "live_url": b.live_url, "n": 0}
+    save_state(st)
+    print(f"browser: {b.id}")
+    print(f"WATCH LIVE (credential-grade — your eyes on it): {b.live_url}")
+    print(f"\nBILLS UNTIL STOPPED: bu-drive stop")
+    if a.url:
+        with Driver(st) as d:
+            d.page.goto(a.url, wait_until="domcontentloaded")
+            d.screenshot()
+
+
+def cmd_url(a):
+    st = load_state()
+    with Driver(st, a.logs) as d:
+        d.page.goto(a.url, wait_until="domcontentloaded")
+        time.sleep(a.wait)
+        d.screenshot()
+        if a.logs: d.dump_logs()
+
+
+def cmd_shot(a):
+    st = load_state()
+    with Driver(st) as d:
+        d.screenshot()
+
+
+def cmd_click(a):
+    st = load_state()
+    with Driver(st, a.logs) as d:
+        d.page.click(a.selector, timeout=a.timeout * 1000)
+        time.sleep(a.wait)
+        d.screenshot()
+        if a.logs: d.dump_logs()
+
+
+def cmd_fill(a):
+    st = load_state()
+    with Driver(st, a.logs) as d:
+        d.page.fill(a.selector, a.text, timeout=a.timeout * 1000)
+        d.screenshot()
+        if a.logs: d.dump_logs()
+
+
+def cmd_press(a):
+    st = load_state()
+    with Driver(st, a.logs) as d:
+        d.page.keyboard.press(a.key)
+        time.sleep(a.wait)
+        d.screenshot()
+        if a.logs: d.dump_logs()
+
+
+def cmd_text(a):
+    st = load_state()
+    with Driver(st) as d:
+        sel = a.selector or "body"
+        txt = d.page.locator(sel).first.inner_text(timeout=a.timeout * 1000)
+        print(txt[:a.max])
+
+
+def cmd_eval(a):
+    st = load_state()
+    with Driver(st, a.logs) as d:
+        result = d.page.evaluate(a.js)
+        print(json.dumps(result, default=str, indent=2)
+              if not isinstance(result, str) else result)
+        if a.logs: d.dump_logs()
+
+
+def cmd_info(a):
+    st = load_state()
+    with Driver(st) as d:
+        print(f"url:   {d.page.url}")
+        print(f"title: {d.page.title()}")
+    print(f"live:  {st['live_url']}")
+    print(f"browser: {st['browser_id']}")
+
+
+def cmd_stop(a):
+    from browser_use_sdk.v3 import BrowserUse
+    key()
+    st = load_state()
+    b = BrowserUse().browsers.stop(st["browser_id"])
+    STATE.unlink(missing_ok=True)
+    print(f"stopped {st['browser_id']}  browser ${b.browser_cost}  proxy ${b.proxy_cost}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="bu-drive", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def logs(sp):
+        sp.add_argument("--logs", action="store_true",
+                        help="also print console + network from this action")
+        sp.add_argument("--wait", type=float, default=1.0, help="settle seconds")
+        sp.add_argument("--timeout", type=float, default=15, help="action timeout s")
+
+    sp = sub.add_parser("start"); sp.add_argument("--profile"); sp.add_argument("--url")
+    sp.add_argument("--no-proxy", action="store_true"); sp.set_defaults(fn=cmd_start)
+    sp = sub.add_parser("url"); sp.add_argument("url"); logs(sp); sp.set_defaults(fn=cmd_url)
+    sub.add_parser("shot").set_defaults(fn=cmd_shot)
+    sp = sub.add_parser("click"); sp.add_argument("selector"); logs(sp); sp.set_defaults(fn=cmd_click)
+    sp = sub.add_parser("fill"); sp.add_argument("selector"); sp.add_argument("text"); logs(sp); sp.set_defaults(fn=cmd_fill)
+    sp = sub.add_parser("press"); sp.add_argument("key"); logs(sp); sp.set_defaults(fn=cmd_press)
+    sp = sub.add_parser("text"); sp.add_argument("selector", nargs="?"); sp.add_argument("--max", type=int, default=4000); sp.add_argument("--timeout", type=float, default=10); sp.set_defaults(fn=cmd_text)
+    sp = sub.add_parser("eval"); sp.add_argument("js"); logs(sp); sp.set_defaults(fn=cmd_eval)
+    sub.add_parser("info").set_defaults(fn=cmd_info)
+    sub.add_parser("stop").set_defaults(fn=cmd_stop)
+
+    a = p.parse_args(); a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

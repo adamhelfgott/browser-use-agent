@@ -1,0 +1,9 @@
+{
+  "default_model": "gpt-5.6-luna",
+  "profiles": {
+    "konstant": "93554040-4184-4e78-adc7-bfb3a2beb076",
+    "gmail": "bfe6d2bc-1e6e-4cb7-8b46-da2499432ef1"
+  },
+  "notify_imessage": "",
+  "human_suffix": " If you encounter a login you cannot complete, a 2FA prompt, a CAPTCHA, or a payment/confirmation step that requires a human, do not guess: stop and clearly report exactly what a human needs to do."
+}
