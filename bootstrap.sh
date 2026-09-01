@@ -16,13 +16,9 @@ REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/adamhelfgott/browser-use
 BU_HOME="${BU_HOME:-$HOME/.agents/browser}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 
-# When run from the bundle dir, siblings are local. When piped `curl … | sh`, there is
-# no bundle dir, so fetch each file from the repo. fetch <name> <dest>.
-if [ -n "${BOOTSTRAP_SRC:-}" ]; then
-  SRC_DIR="$BOOTSTRAP_SRC"
-else
-  SRC_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || echo /nonexistent)"
-fi
+# Siblings come from the repo by default (works when piped `curl … | sh`). If a local
+# bundle dir is staged, set BOOTSTRAP_SRC=/path/to/bundle to copy from it instead.
+SRC_DIR="${BOOTSTRAP_SRC:-/nonexistent}"
 fetch() {  # fetch <name> <dest>
   if [ -f "$SRC_DIR/$1" ]; then cp "$SRC_DIR/$1" "$2"
   else curl -fsSL "$REPO_RAW/$1" -o "$2"; fi
