@@ -46,6 +46,9 @@ if [ ! -f "$BU_HOME/config.json" ]; then
   fetch config.json "$BU_HOME/config.json"
 fi
 
+# 3b. the deep instruction doc, so the session can read it locally
+fetch BROWSER-USE.md "$BU_HOME/BROWSER-USE.md" 2>/dev/null || true
+
 # 4. the key: prefer an existing key file, else take it from the environment
 if [ -n "${BROWSER_USE_API_KEY:-}" ] && [ ! -s "$BU_HOME/credentials/api_key" ]; then
   printf '%s' "$BROWSER_USE_API_KEY" > "$BU_HOME/credentials/api_key"
