@@ -28,8 +28,13 @@ bu models                                        # verify
 
 The bundle (`bu`, `bu-drive`, `config.json`, `bootstrap.sh`, this doc) carries **no
 secret**. The only secret is `BROWSER_USE_API_KEY` (starts `bu_`, travels in the
-`X-Browser-Use-API-Key` header). Provide it via the environment or a mounted secret;
-never hard-code, print, or commit it. **Profiles are account-scoped on Browser Use's
+`X-Browser-Use-API-Key` header); never hard-code, print, or commit it. bootstrap.sh
+sources it in this order: an existing `~/.agents/browser/credentials/api_key` file →
+the `BROWSER_USE_API_KEY` env var → **Doppler** (`shared-vendors/prd`, override with
+`BU_DOPPLER_PROJECT`/`BU_DOPPLER_CONFIG`). So a cloud session needs EITHER
+`BROWSER_USE_API_KEY` in its env, OR Doppler access (a `DOPPLER_TOKEN` service token
+scoped to shared-vendors/prd) — the latter keeps the raw key out of every cloud env
+and rotates in one place. **Profiles are account-scoped on Browser Use's
 side**, so any session with the same key sees the same synced logins — the two profile
 aliases (`konstant`, `gmail`) in `config.json` work everywhere the key does.
 

@@ -49,10 +49,23 @@ fi
 # 3b. the deep instruction doc, so the session can read it locally
 fetch BROWSER-USE.md "$BU_HOME/BROWSER-USE.md" 2>/dev/null || true
 
-# 4. the key: prefer an existing key file, else take it from the environment
-if [ -n "${BROWSER_USE_API_KEY:-}" ] && [ ! -s "$BU_HOME/credentials/api_key" ]; then
-  printf '%s' "$BROWSER_USE_API_KEY" > "$BU_HOME/credentials/api_key"
-  chmod 600 "$BU_HOME/credentials/api_key"
+# 4. the key: existing file > env var > Doppler (shared-vendors/prd). Never printed.
+if [ ! -s "$BU_HOME/credentials/api_key" ]; then
+  if [ -n "${BROWSER_USE_API_KEY:-}" ]; then
+    printf '%s' "$BROWSER_USE_API_KEY" > "$BU_HOME/credentials/api_key"
+  elif command -v doppler >/dev/null 2>&1; then
+    DP_PROJECT="${BU_DOPPLER_PROJECT:-shared-vendors}"
+    DP_CONFIG="${BU_DOPPLER_CONFIG:-prd}"
+    if doppler secrets get BROWSER_USE_API_KEY -p "$DP_PROJECT" -c "$DP_CONFIG" \
+         --plain > "$BU_HOME/credentials/api_key.tmp" 2>/dev/null \
+       && [ -s "$BU_HOME/credentials/api_key.tmp" ]; then
+      mv "$BU_HOME/credentials/api_key.tmp" "$BU_HOME/credentials/api_key"
+      echo "bootstrap: key loaded from Doppler ($DP_PROJECT/$DP_CONFIG)"
+    else
+      rm -f "$BU_HOME/credentials/api_key.tmp"
+    fi
+  fi
+  [ -s "$BU_HOME/credentials/api_key" ] && chmod 600 "$BU_HOME/credentials/api_key"
 fi
 
 case ":$PATH:" in *":$BIN_DIR:"*) : ;; *)
