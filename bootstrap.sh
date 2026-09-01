@@ -12,9 +12,21 @@
 # Browser Use's side, so any session with the same key sees the same synced logins.
 set -eu
 
-SRC_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/adamhelfgott/browser-use-agent/main}"
 BU_HOME="${BU_HOME:-$HOME/.agents/browser}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+
+# When run from the bundle dir, siblings are local. When piped `curl … | sh`, there is
+# no bundle dir, so fetch each file from the repo. fetch <name> <dest>.
+if [ -n "${BOOTSTRAP_SRC:-}" ]; then
+  SRC_DIR="$BOOTSTRAP_SRC"
+else
+  SRC_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || echo /nonexistent)"
+fi
+fetch() {  # fetch <name> <dest>
+  if [ -f "$SRC_DIR/$1" ]; then cp "$SRC_DIR/$1" "$2"
+  else curl -fsSL "$REPO_RAW/$1" -o "$2"; fi
+}
 
 echo "bootstrap: installing bu tooling"
 mkdir -p "$BIN_DIR" "$BU_HOME/runs" "$BU_HOME/credentials"
@@ -29,13 +41,13 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 2. the two scripts
-cp "$SRC_DIR/bu" "$BIN_DIR/bu"
-cp "$SRC_DIR/bu-drive" "$BIN_DIR/bu-drive"
+fetch bu "$BIN_DIR/bu"
+fetch bu-drive "$BIN_DIR/bu-drive"
 chmod +x "$BIN_DIR/bu" "$BIN_DIR/bu-drive"
 
 # 3. config (only if absent — never clobber a customized local config)
 if [ ! -f "$BU_HOME/config.json" ]; then
-  cp "$SRC_DIR/config.json" "$BU_HOME/config.json"
+  fetch config.json "$BU_HOME/config.json"
 fi
 
 # 4. the key: prefer an existing key file, else take it from the environment
